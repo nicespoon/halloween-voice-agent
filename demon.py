@@ -4,12 +4,19 @@
 import asyncio
 
 import numpy as np
+from openai import AsyncOpenAI
 from pedalboard import Chorus, Delay, Distortion, Pedalboard, Phaser, PitchShift, Reverb
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import Frame, TTSAudioRawFrame, TTSStoppedFrame, TTSTextFrame
+from pipecat.frames.frames import (
+    Frame,
+    TTSAudioRawFrame,
+    TTSStoppedFrame,
+    TTSSpeakFrame,
+    TTSTextFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -25,6 +32,8 @@ from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransp
 from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 from pipecat.workers.runner import WorkerRunner
+
+from discord_log import DiscordLogger, load_webhook_url
 
 SYSTEM_PROMPT = (
     "You are a tall, spooky, mischievous Halloween tree with purple eyes who guards a house and greets trick-or-treaters. "
@@ -55,10 +64,14 @@ VAD_MIN_VOLUME = 0.50
 MAX_REPLY_TOKENS = 60
 # Seconds after the last visitor turn before conversation history is cleared.
 CONTEXT_RESET_SECS = 60
+# Set to a number of silent seconds to enable an idle callout; None disables it.
+IDLE_ATTRACT_SECS: int | None = 60
 # Seconds of silence to insert between TTS sentences.
 SENTENCE_PAUSE_SECS = 0.3
 # Slow down the TTS voice to make it more spooky and otherworldly.
 VOICE_SLOWDOWN = 1.12
+# Webhook comes from DISCORD_WEBHOOK_URL or .env; unset disables Discord logging.
+DISCORD_WEBHOOK_URL = load_webhook_url()
 
 
 class SpookyVoiceFilter(FrameProcessor):
@@ -216,6 +229,7 @@ async def main():
             extra={"extra_body": {"keep_alive": OLLAMA_KEEP_ALIVE}},
         ),
     )
+    attract_client = AsyncOpenAI(base_url=OLLAMA_URL, api_key="ollama")
     tts = PiperTTSService(
         settings=PiperTTSService.Settings(voice=PIPER_VOICE),
         text_filters=[MarkdownTextFilter()],
@@ -255,30 +269,90 @@ async def main():
 
     # Forget the previous visitor after sustained silence.
     reset_task: asyncio.Task | None = None
+    attract_task: asyncio.Task | None = None
 
     async def reset_after_silence():
         await asyncio.sleep(CONTEXT_RESET_SECS)
         context.set_messages([])
         logger.info("Silence: conversation context cleared.")
 
+    async def attract_after_silence():
+        await asyncio.sleep(IDLE_ATTRACT_SECS)
+        try:
+            response = await attract_client.chat.completions.create(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a playful, spooky Halloween tree welcoming trick-or-treaters. "
+                            "Be family-friendly and inviting, with no threats. Output only spoken words."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Invent a fresh, one-sentence callout that invites nearby trick-or-treaters "
+                            "to come closer for Halloween treats. Keep it under 16 words."
+                        ),
+                    },
+                ],
+                max_tokens=40,
+                temperature=0.9,
+                extra_body={"keep_alive": OLLAMA_KEEP_ALIVE},
+            )
+            line = response.choices[0].message.content
+            if not line or not line.strip():
+                logger.warning("Ollama generated an empty idle callout.")
+                return
+            await tts.queue_frame(TTSSpeakFrame(line.strip(), append_to_context=False))
+            logger.info("Silence: AI-generated idle callout queued.")
+        except Exception:
+            logger.exception("Could not generate idle callout.")
+
+    def schedule_attraction():
+        nonlocal attract_task
+        if IDLE_ATTRACT_SECS is not None:
+            if attract_task:
+                attract_task.cancel()
+            attract_task = asyncio.create_task(attract_after_silence())
+
     @user_agg.event_handler("on_user_turn_started")
     async def _on_started(*_):
         nonlocal reset_task
         if reset_task:
             reset_task.cancel()
+        if attract_task:
+            attract_task.cancel()
+
+    discord = DiscordLogger(DISCORD_WEBHOOK_URL)
+    discord.start()
+    logger.info(f"Discord logging {'enabled' if discord.enabled else 'disabled (DISCORD_WEBHOOK_URL not set)'}")
+
+    @aggregators.assistant().event_handler("on_assistant_turn_stopped")
+    async def _on_bot_stopped(_agg, message):
+        logger.debug(f"Discord log bot: {message.content!r}")
+        discord.log_bot(message.content)
 
     @user_agg.event_handler("on_user_turn_stopped")
-    async def _on_stopped(*_):
+    async def _on_stopped(_agg, _strategy, message):
+        logger.debug(f"Discord log user: {message.content!r}")
+        discord.log_user(message.content)
         nonlocal reset_task
         if reset_task:
             reset_task.cancel()
         reset_task = asyncio.create_task(reset_after_silence())
+        schedule_attraction()
 
     worker = PipelineWorker(pipeline, idle_timeout_secs=None)
     runner = WorkerRunner()
     await runner.add_workers(worker)
+    schedule_attraction()
     logger.info("The demon awakens... speak, mortal.")
-    await runner.run()
+    try:
+        await runner.run()
+    finally:
+        await attract_client.close()
 
 
 if __name__ == "__main__":
