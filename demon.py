@@ -65,7 +65,7 @@ MAX_REPLY_TOKENS = 60
 # Seconds after the last visitor turn before conversation history is cleared.
 CONTEXT_RESET_SECS = 60
 # Set to a number of silent seconds to enable an idle callout; None disables it.
-IDLE_ATTRACT_SECS: int | None = 60
+IDLE_ATTRACT_SECS: int | None = 180
 # Seconds of silence to insert between TTS sentences.
 SENTENCE_PAUSE_SECS = 0.3
 # Slow down the TTS voice to make it more spooky and otherworldly.
@@ -277,38 +277,41 @@ async def main():
         logger.info("Silence: conversation context cleared.")
 
     async def attract_after_silence():
-        await asyncio.sleep(IDLE_ATTRACT_SECS)
-        try:
-            response = await attract_client.chat.completions.create(
-                model=OLLAMA_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a playful, spooky Halloween tree welcoming trick-or-treaters. "
-                            "Be family-friendly and inviting, with no threats. Output only spoken words."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Invent a fresh, one-sentence callout that invites nearby trick-or-treaters "
-                            "to come closer for Halloween treats. Keep it under 16 words."
-                        ),
-                    },
-                ],
-                max_tokens=40,
-                temperature=0.9,
-                extra_body={"keep_alive": OLLAMA_KEEP_ALIVE},
-            )
-            line = response.choices[0].message.content
-            if not line or not line.strip():
-                logger.warning("Ollama generated an empty idle callout.")
-                return
-            await tts.queue_frame(TTSSpeakFrame(line.strip(), append_to_context=False))
-            logger.info("Silence: AI-generated idle callout queued.")
-        except Exception:
-            logger.exception("Could not generate idle callout.")
+        if IDLE_ATTRACT_SECS is None:
+            return
+        while True:
+            await asyncio.sleep(IDLE_ATTRACT_SECS)
+            try:
+                response = await attract_client.chat.completions.create(
+                    model=OLLAMA_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a playful, spooky Halloween tree welcoming trick-or-treaters. "
+                                "Be family-friendly and inviting, with no threats. Output only spoken words."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "Invent a fresh, one-sentence callout that invites nearby trick-or-treaters "
+                                "to come closer for Halloween treats. Keep it under 16 words."
+                            ),
+                        },
+                    ],
+                    max_tokens=40,
+                    temperature=0.9,
+                    extra_body={"keep_alive": OLLAMA_KEEP_ALIVE},
+                )
+                line = response.choices[0].message.content
+                if not line or not line.strip():
+                    logger.warning("Ollama generated an empty idle callout.")
+                    continue
+                await tts.queue_frame(TTSSpeakFrame(line.strip(), append_to_context=False))
+                logger.info("Silence: AI-generated idle callout queued.")
+            except Exception:
+                logger.exception("Could not generate idle callout.")
 
     def schedule_attraction():
         nonlocal attract_task
