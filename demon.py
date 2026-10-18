@@ -49,7 +49,7 @@ SYSTEM_PROMPT = (
 OLLAMA_URL = "http://localhost:11434/v1"
 OLLAMA_MODEL = "gemma3:4b"
 OLLAMA_KEEP_ALIVE = "1h"
-WHISPER_MODEL = "tiny.en"
+WHISPER_MODEL = "small.en"
 PIPER_VOICE = "en_GB-alan-medium"
 
 # Keep detection responsive to quieter and higher-pitched voices.
@@ -59,7 +59,7 @@ MUTE_USER_WHILE_SPEAKING = True
 # Seconds of silence before the visitor's turn is considered finished.
 VAD_STOP_SECS = 0.2
 # Minimum measured audio volume required for speech detection.
-VAD_MIN_VOLUME = 0.50
+VAD_MIN_VOLUME = 0.40
 # Cap reply length so generation (and speech) stays short and quick.
 MAX_REPLY_TOKENS = 60
 # Seconds after the last visitor turn before conversation history is cleared.
@@ -70,6 +70,10 @@ IDLE_ATTRACT_SECS: int | None = 180
 SENTENCE_PAUSE_SECS = 0.3
 # Slow down the TTS voice to make it more spooky and otherworldly.
 VOICE_SLOWDOWN = 1.12
+# Max seconds of reverb/delay tail appended after speech; the visitor stays muted during it.
+TAIL_MAX_SECS = 1.0
+# Tail samples quieter than this (0-1 scale) are cut off.
+TAIL_AUDIBLE_LEVEL = 0.005
 # Webhook comes from DISCORD_WEBHOOK_URL or .env; unset disables Discord logging.
 DISCORD_WEBHOOK_URL = load_webhook_url()
 
@@ -140,7 +144,7 @@ class SpookyVoiceFilter(FrameProcessor):
         block_size = 1024
         silence_blocks = 0
         output_blocks = []
-        max_blocks = max(1, int(rate * 4 / block_size))
+        max_blocks = max(1, int(rate * TAIL_MAX_SECS / block_size))
 
         for _ in range(max_blocks):
             silence = np.zeros(block_size, dtype=np.float32)
@@ -148,9 +152,9 @@ class SpookyVoiceFilter(FrameProcessor):
             if not processed.size:
                 continue
             output_blocks.append(processed)
-            if np.max(np.abs(processed)) < 0.0005:
+            if np.max(np.abs(processed)) < TAIL_AUDIBLE_LEVEL:
                 silence_blocks += 1
-                if silence_blocks >= 8:
+                if silence_blocks >= 2:
                     break
             else:
                 silence_blocks = 0
@@ -158,10 +162,10 @@ class SpookyVoiceFilter(FrameProcessor):
         if not output_blocks:
             return b""
         tail = np.concatenate(output_blocks)
-        audible_samples = np.flatnonzero(np.abs(tail) > 0.0005)
+        audible_samples = np.flatnonzero(np.abs(tail) > TAIL_AUDIBLE_LEVEL)
         if not audible_samples.size:
             return b""
-        tail = tail[: audible_samples[-1] + int(rate * 0.08)]
+        tail = tail[: audible_samples[-1] + int(rate * 0.02)]
         return self._to_pcm(tail)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -296,7 +300,7 @@ async def main():
                             "role": "user",
                             "content": (
                                 "Invent a fresh, one-sentence callout that invites nearby trick-or-treaters "
-                                "to come closer for Halloween treats. Keep it under 16 words."
+                                "to come closer to talk or get Halloween treats. Keep it under 16 words."
                             ),
                         },
                     ],
