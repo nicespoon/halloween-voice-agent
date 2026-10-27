@@ -53,13 +53,13 @@ WHISPER_MODEL = "small.en"
 PIPER_VOICE = "en_GB-alan-medium"
 
 # Keep detection responsive to quieter and higher-pitched voices.
-VAD_CONFIDENCE = 0.65
+VAD_CONFIDENCE = 0.40
 # Ignore microphone input while the demon is speaking.
 MUTE_USER_WHILE_SPEAKING = True
 # Seconds of silence before the visitor's turn is considered finished.
 VAD_STOP_SECS = 0.2
 # Minimum measured audio volume required for speech detection.
-VAD_MIN_VOLUME = 0.40
+VAD_MIN_VOLUME = 0.10
 # Cap reply length so generation (and speech) stays short and quick.
 MAX_REPLY_TOKENS = 60
 # Seconds after the last visitor turn before conversation history is cleared.
@@ -100,29 +100,24 @@ class SpookyVoiceFilter(FrameProcessor):
             ]
         )
         self._audio_buffer = bytearray()
-        self._pause_before_next_audio = False
+        self._emitted_sentence = False
         self._sample_rate: int | None = None
         self._reset()
 
     def _reset(self):
         self._effects.reset()
         self._audio_buffer.clear()
-        self._pause_before_next_audio = False
+        self._emitted_sentence = False
         self._sample_rate = None
 
-    def _process_audio(self, pcm: bytes, rate: int) -> bytes:
-        if self._pause_before_next_audio and self._audio_buffer:
-            pause_samples = int(rate * SENTENCE_PAUSE_SECS)
-            self._audio_buffer.extend(b"\x00" * (pause_samples * 2))
-        self._pause_before_next_audio = False
-        self._audio_buffer.extend(pcm)
-        self._sample_rate = rate
-        return b""
-
-    def _process_turn(self, rate: int) -> bytes:
+    def _process_sentence(self, rate: int) -> bytes:
         if not self._audio_buffer:
             return b""
         audio = np.frombuffer(self._audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+        if self._emitted_sentence:
+            audio = np.concatenate([np.zeros(int(rate * SENTENCE_PAUSE_SECS), dtype=np.float32), audio])
+        self._emitted_sentence = True
+        # reset=True compensates PitchShift latency; reset=False would hold back the end of each sentence.
         processed = self._effects.process(audio, rate, reset=True)
         if processed.size:
             slowed_size = int(processed.size * VOICE_SLOWDOWN)
@@ -132,6 +127,8 @@ class SpookyVoiceFilter(FrameProcessor):
                 processed,
             )
         self._audio_buffer.clear()
+        # Let the reverb decay inside the chunk so the next one doesn't start on a hard cut.
+        processed = np.concatenate([processed, self._flush_effects(rate)])
         return self._to_pcm(processed)
 
     @staticmethod
@@ -140,7 +137,7 @@ class SpookyVoiceFilter(FrameProcessor):
             return b""
         return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
-    def _flush_effects(self, rate: int) -> bytes:
+    def _flush_effects(self, rate: int) -> np.ndarray:
         block_size = 1024
         silence_blocks = 0
         output_blocks = []
@@ -160,32 +157,24 @@ class SpookyVoiceFilter(FrameProcessor):
                 silence_blocks = 0
 
         if not output_blocks:
-            return b""
+            return np.zeros(0, dtype=np.float32)
         tail = np.concatenate(output_blocks)
         audible_samples = np.flatnonzero(np.abs(tail) > TAIL_AUDIBLE_LEVEL)
         if not audible_samples.size:
-            return b""
-        tail = tail[: audible_samples[-1] + int(rate * 0.02)]
-        return self._to_pcm(tail)
+            return np.zeros(0, dtype=np.float32)
+        return tail[: audible_samples[-1] + int(rate * 0.02)]
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSAudioRawFrame) and frame.num_channels == 1:
             self._sample_rate = frame.sample_rate
-            out = self._process_audio(frame.audio, frame.sample_rate)
-            if out:
-                frame.audio = out
-                frame.num_frames = len(out) // 2
-                await self.push_frame(frame, direction)
+            self._audio_buffer.extend(frame.audio)
             return
         if isinstance(frame, TTSTextFrame):
-            if frame.will_be_spoken:
-                self._pause_before_next_audio = bool(self._audio_buffer)
-            await self.push_frame(frame, direction)
-            return
-        if isinstance(frame, TTSStoppedFrame):
-            if self._sample_rate is not None:
-                speech = self._process_turn(self._sample_rate)
+            # Piper pushes the text frame after the sentence's audio, so it marks a sentence boundary.
+            if frame.will_be_spoken and self._sample_rate is not None:
+                # Off the event loop: blocking it starves the audio writer and causes pops mid-playback.
+                speech = await asyncio.to_thread(self._process_sentence, self._sample_rate)
                 if speech:
                     await self.push_frame(
                         TTSAudioRawFrame(
@@ -196,11 +185,15 @@ class SpookyVoiceFilter(FrameProcessor):
                         ),
                         direction,
                     )
-                tail = self._flush_effects(self._sample_rate)
-                if tail:
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, TTSStoppedFrame):
+            if self._sample_rate is not None:
+                speech = await asyncio.to_thread(self._process_sentence, self._sample_rate)
+                if speech:
                     await self.push_frame(
                         TTSAudioRawFrame(
-                            audio=tail,
+                            audio=speech,
                             sample_rate=self._sample_rate,
                             num_channels=1,
                             context_id=frame.context_id,
