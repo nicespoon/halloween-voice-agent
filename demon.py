@@ -86,18 +86,18 @@ class SpookyVoiceFilter(FrameProcessor):
         super().__init__(**kwargs)
         self._effects = Pedalboard(
             [
-                PitchShift(semitones=-3.5),
+                PitchShift(semitones=-2.5),
                 Chorus(
                     rate_hz=0.3,
-                    depth=0.25,
+                    depth=0.2,
                     centre_delay_ms=9.0,
                     feedback=0.1,
-                    mix=0.22,
+                    mix=0.16,
                 ),
-                Phaser(rate_hz=0.18, depth=0.55, feedback=0.15, mix=0.12),
-                Distortion(drive_db=3.0),
-                Delay(delay_seconds=0.26, feedback=0.2, mix=0.12),
-                Reverb(room_size=0.75, damping=0.5, wet_level=0.12, dry_level=0.88),
+                Phaser(rate_hz=0.18, depth=0.4, feedback=0.15, mix=0.08),
+                Distortion(drive_db=2.0),
+                Delay(delay_seconds=0.26, feedback=0.15, mix=0.08),
+                Reverb(room_size=0.65, damping=0.5, wet_level=0.09, dry_level=0.91),
             ]
         )
         self._audio_buffer = bytearray()
