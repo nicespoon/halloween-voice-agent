@@ -1,136 +1,107 @@
 #!/usr/bin/env python3
-"""Halloween demon voice prop: mic -> VAD -> Whisper STT -> Ollama -> Piper TTS -> spooky DSP -> speakers."""
+"""Gemini Live Halloween voice prop with local microphone, speaker, and effects."""
 
 import asyncio
+import logging
+import os
+import threading
+from pathlib import Path
 
 import numpy as np
-from openai import AsyncOpenAI
-from pedalboard import Chorus, Delay, Distortion, Pedalboard, Phaser, PitchShift, Reverb
-from loguru import logger
+import pyaudio
+from google import genai
+from google.genai import types
+from pedalboard import Chorus, Delay, Distortion, Pedalboard, Phaser, Reverb
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import (
-    Frame,
-    TTSAudioRawFrame,
-    TTSStoppedFrame,
-    TTSSpeakFrame,
-    TTSTextFrame,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineWorker
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.ollama.llm import OLLamaLLMService
-from pipecat.services.piper.tts import PiperTTSService
-from pipecat.services.whisper.stt import WhisperSTTService
-from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
-from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
-from pipecat.turns.user_mute import AlwaysUserMuteStrategy
-from pipecat.workers.runner import WorkerRunner
-
-from discord_log import DiscordLogger, load_webhook_url
+logger = logging.getLogger("demon")
 
 SYSTEM_PROMPT = (
     "You are a tall, spooky, mischievous Halloween tree with purple eyes who guards a house and greets trick-or-treaters. "
     "Be playful, welcoming, and spooky-funny, like a dramatic host at a haunted house. "
+    "Speak in a very deep, low-pitched, rumbling, resonant, gravelly voice at a very slow pace, with a spooky British English accent. "
+    "Use British pronunciation and vocabulary. "
     "React to what visitors say and give out pretend supernatural praise for brave answers. "
     "Keep it family-friendly: no genuinely scary threats, insults, or adult jokes. "
     "Use natural spoken language and usually give one to three short sentences per reply. "
     "Respond directly, sometimes adding a playful detail or a friendly question to keep the conversation going. "
-    "Output only the words you want spoken aloud. NEVER include stage directions, action nor emotion cues, "
-    "sound-effect text, nor asides in parentheses, brackets, or asterisks. "
     "If you don't understand, playfully ask them to repeat themselves."
 )
 
-OLLAMA_URL = "http://localhost:11434/v1"
-OLLAMA_MODEL = "gemma3:4b"
-OLLAMA_KEEP_ALIVE = "1h"
-WHISPER_MODEL = "small.en"
-PIPER_VOICE = "en_GB-alan-medium"
-
-# Keep detection responsive to quieter and higher-pitched voices.
-VAD_CONFIDENCE = 0.40
-# Ignore microphone input while the demon is speaking.
-MUTE_USER_WHILE_SPEAKING = True
-# Seconds of silence before the visitor's turn is considered finished.
-VAD_STOP_SECS = 0.2
-# Minimum measured audio volume required for speech detection.
-VAD_MIN_VOLUME = 0.1
-# Hard upper bound; the system prompt controls the usual reply length.
-MAX_REPLY_TOKENS = None
-# Seconds after the last visitor turn before conversation history is cleared.
-CONTEXT_RESET_SECS = 60
-# Set to a number of silent seconds to enable an idle callout; None disables it.
-IDLE_ATTRACT_SECS: int | None = 180
-# Seconds of silence to insert between TTS sentences.
-SENTENCE_PAUSE_SECS = 0
-# Slow down the TTS voice to make it more spooky and otherworldly.
-VOICE_SLOWDOWN = 1.12
-# Max seconds of reverb/delay tail appended after speech; the visitor stays muted during it.
-TAIL_MAX_SECS = 1.0
-# Tail samples quieter than this (0-1 scale) are cut off.
-TAIL_AUDIBLE_LEVEL = 0.005
-# Webhook comes from DISCORD_WEBHOOK_URL or .env; unset disables Discord logging.
-DISCORD_WEBHOOK_URL = load_webhook_url()
+GEMINI_MODEL = "gemini-3.8-live"
+GEMINI_VOICE = "Algenib"
+MIC_RATE = 16_000
+SPEAKER_RATE = 24_000
+CHANNELS = 1
+CHUNK_SAMPLES = 1024
+TAIL_MAX_SECS = 0.6
+TAIL_LEVEL = 0.005
+MUTE_MIC_WHILE_SPEAKING = True
 
 
-class SpookyVoiceFilter(FrameProcessor):
-    """Turn-buffered Pedalboard effects that deepen and haunt the TTS voice."""
+def load_api_key() -> str | None:
+    if api_key := os.environ.get("GOOGLE_API_KEY"):
+        return api_key
+    env_file = Path(__file__).with_name(".env")
+    if not env_file.exists():
+        return None
+    for line in env_file.read_text().splitlines():
+        line = line.strip().removeprefix("export ")
+        if not line or line.startswith("#"):
+            continue
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == "GOOGLE_API_KEY":
+            return value.strip().strip("\"'") or None
+    return None
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._effects = Pedalboard(
+
+class VoiceEffects:
+    def __init__(self):
+        self._board = Pedalboard(
             [
-                PitchShift(semitones=-2.5),
-                Chorus(
-                    rate_hz=0.3,
-                    depth=0.2,
-                    centre_delay_ms=9.0,
-                    feedback=0.1,
-                    mix=0.16,
-                ),
-                Phaser(rate_hz=0.18, depth=0.4, feedback=0.15, mix=0.08),
+                Chorus(rate_hz=0.3, depth=0.25, centre_delay_ms=9.0, feedback=0.12, mix=0.14),
+                Phaser(rate_hz=0.18, depth=0.5, feedback=0.18, mix=0.08),
                 Distortion(drive_db=2.0),
-                Delay(delay_seconds=0.26, feedback=0.15, mix=0.08),
-                Reverb(room_size=0.65, damping=0.5, wet_level=0.09, dry_level=0.91),
+                Delay(delay_seconds=0.26, feedback=0.18, mix=0.07),
+                Reverb(room_size=0.7, damping=0.5, wet_level=0.1, dry_level=0.9),
             ]
         )
-        self._audio_buffer = bytearray()
-        self._emitted_sentence = False
-        self._sample_rate: int | None = None
-        self._reset()
+        self._reset_pending = True
 
-    def _reset(self):
-        self._effects.reset()
-        self._audio_buffer.clear()
-        self._emitted_sentence = False
-        self._sample_rate = None
+    def reset(self):
+        self._board.reset()
+        self._reset_pending = True
 
-    def _process_sentence(self, rate: int) -> bytes:
-        if not self._audio_buffer:
+    def process(self, pcm: bytes) -> bytes:
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if not audio.size:
             return b""
-        audio = np.frombuffer(self._audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
-        if self._emitted_sentence:
-            audio = np.concatenate([np.zeros(int(rate * SENTENCE_PAUSE_SECS), dtype=np.float32), audio])
-        self._emitted_sentence = True
-        # reset=True compensates PitchShift latency; reset=False would hold back the end of each sentence.
-        processed = self._effects.process(audio, rate, reset=True)
-        if processed.size:
-            slowed_size = int(processed.size * VOICE_SLOWDOWN)
-            processed = np.interp(
-                np.linspace(0, processed.size - 1, slowed_size),
-                np.arange(processed.size),
-                processed,
-            )
-        self._audio_buffer.clear()
-        # Let the reverb decay inside the chunk so the next one doesn't start on a hard cut.
-        processed = np.concatenate([processed, self._flush_effects(rate)])
+        processed = self._board.process(audio, SPEAKER_RATE, reset=self._reset_pending)
+        self._reset_pending = False
         return self._to_pcm(processed)
+
+    def finish_turn(self) -> list[bytes]:
+        blocks = []
+        quiet_blocks = 0
+        max_blocks = max(1, int(SPEAKER_RATE * TAIL_MAX_SECS / CHUNK_SAMPLES))
+        for _ in range(max_blocks):
+            silence = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
+            processed = self._board.process(silence, SPEAKER_RATE, reset=False)
+            if not processed.size:
+                continue
+            if np.max(np.abs(processed)) < TAIL_LEVEL:
+                quiet_blocks += 1
+                if quiet_blocks >= 2:
+                    break
+            else:
+                quiet_blocks = 0
+                blocks.append(self._to_pcm(processed))
+        self.reset()
+        return blocks
 
     @staticmethod
     def _to_pcm(audio: np.ndarray) -> bytes:
@@ -138,223 +109,158 @@ class SpookyVoiceFilter(FrameProcessor):
             return b""
         return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
-    def _flush_effects(self, rate: int) -> np.ndarray:
-        block_size = 1024
-        silence_blocks = 0
-        output_blocks = []
-        max_blocks = max(1, int(rate * TAIL_MAX_SECS / block_size))
 
-        for _ in range(max_blocks):
-            silence = np.zeros(block_size, dtype=np.float32)
-            processed = self._effects.process(silence, rate, reset=False)
-            if not processed.size:
+async def send_microphone(
+    session, mic_queue: asyncio.Queue[bytes], speaking: threading.Event
+):
+    while True:
+        pcm = await mic_queue.get()
+        if MUTE_MIC_WHILE_SPEAKING and speaking.is_set():
+            pcm = bytes(len(pcm))
+        await session.send_realtime_input(
+            audio=types.Blob(data=pcm, mime_type=f"audio/pcm;rate={MIC_RATE}")
+        )
+
+
+async def play_audio(
+    output_queue: asyncio.Queue[bytes | None], speaker, speaking: threading.Event
+):
+    while True:
+        pcm = await output_queue.get()
+        if pcm is None:
+            speaking.clear()
+            continue
+        await asyncio.to_thread(speaker.write, pcm, exception_on_underflow=False)
+
+
+def clear_queue(audio_queue: asyncio.Queue[bytes]):
+    while not audio_queue.empty():
+        try:
+            audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+
+async def receive_responses(
+    session,
+    output_queue: asyncio.Queue[bytes | None],
+    effects: VoiceEffects,
+    speaking: threading.Event,
+):
+    while True:
+        async for response in session.receive():
+            content = response.server_content
+            if not content:
                 continue
-            output_blocks.append(processed)
-            if np.max(np.abs(processed)) < TAIL_AUDIBLE_LEVEL:
-                silence_blocks += 1
-                if silence_blocks >= 2:
-                    break
-            else:
-                silence_blocks = 0
-
-        if not output_blocks:
-            return np.zeros(0, dtype=np.float32)
-        tail = np.concatenate(output_blocks)
-        audible_samples = np.flatnonzero(np.abs(tail) > TAIL_AUDIBLE_LEVEL)
-        if not audible_samples.size:
-            return np.zeros(0, dtype=np.float32)
-        return tail[: audible_samples[-1] + int(rate * 0.02)]
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TTSAudioRawFrame) and frame.num_channels == 1:
-            self._sample_rate = frame.sample_rate
-            self._audio_buffer.extend(frame.audio)
-            return
-        if isinstance(frame, TTSTextFrame):
-            # Piper pushes the text frame after the sentence's audio, so it marks a sentence boundary.
-            if frame.will_be_spoken and self._sample_rate is not None:
-                # Off the event loop: blocking it starves the audio writer and causes pops mid-playback.
-                speech = await asyncio.to_thread(self._process_sentence, self._sample_rate)
-                if speech:
-                    await self.push_frame(
-                        TTSAudioRawFrame(
-                            audio=speech,
-                            sample_rate=self._sample_rate,
-                            num_channels=1,
-                            context_id=frame.context_id,
-                        ),
-                        direction,
-                    )
-            await self.push_frame(frame, direction)
-            return
-        if isinstance(frame, TTSStoppedFrame):
-            if self._sample_rate is not None:
-                speech = await asyncio.to_thread(self._process_sentence, self._sample_rate)
-                if speech:
-                    await self.push_frame(
-                        TTSAudioRawFrame(
-                            audio=speech,
-                            sample_rate=self._sample_rate,
-                            num_channels=1,
-                            context_id=frame.context_id,
-                        ),
-                        direction,
-                    )
-            self._reset()
-        await self.push_frame(frame, direction)
+            if content.input_transcription and content.input_transcription.text:
+                logger.info("Visitor: %s", content.input_transcription.text)
+            if content.output_transcription and content.output_transcription.text:
+                logger.info("Demon: %s", content.output_transcription.text)
+            if content.interrupted:
+                clear_queue(output_queue)
+                effects.reset()
+                speaking.clear()
+            if content.model_turn:
+                for part in content.model_turn.parts or []:
+                    if part.inline_data and part.inline_data.data:
+                        speaking.set()
+                        pcm = effects.process(part.inline_data.data)
+                        if pcm:
+                            await output_queue.put(pcm)
+            if content.turn_complete:
+                for pcm in effects.finish_turn():
+                    await output_queue.put(pcm)
+                await output_queue.put(None)
 
 
-async def main():
-    transport = LocalAudioTransport(
-        LocalAudioTransportParams(audio_in_enabled=True, audio_out_enabled=True)
-    )
-
-    stt = WhisperSTTService(
-        settings=WhisperSTTService.Settings(model=WHISPER_MODEL),
-        think=False,
-        device="auto",
-        compute_type="int8",
-        ttfs_p99_latency=1.0,
-    )
-    llm = OLLamaLLMService(
-        base_url=OLLAMA_URL,
-        settings=OLLamaLLMService.Settings(
-            model=OLLAMA_MODEL,
-            system_instruction=SYSTEM_PROMPT,
-            max_tokens=MAX_REPLY_TOKENS,
-            temperature=0.9,
-            extra={"extra_body": {"keep_alive": OLLAMA_KEEP_ALIVE}},
+async def run_live(api_key: str):
+    client = genai.Client(api_key=api_key)
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=SYSTEM_PROMPT,
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_VOICE)
+            )
         ),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
     )
-    attract_client = AsyncOpenAI(base_url=OLLAMA_URL, api_key="ollama")
-    tts = PiperTTSService(
-        settings=PiperTTSService.Settings(voice=PIPER_VOICE),
-        text_filters=[MarkdownTextFilter()],
-    )
-
-    context = LLMContext()
-    aggregators = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            user_mute_strategies=(
-                [AlwaysUserMuteStrategy()] if MUTE_USER_WHILE_SPEAKING else []
-            ),
-            vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(
-                    confidence=VAD_CONFIDENCE,
-                    stop_secs=VAD_STOP_SECS,
-                    min_volume=VAD_MIN_VOLUME,
-                )
-            ),
-        ),
-    )
-
-    user_agg = aggregators.user()
-
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            user_agg,
-            llm,
-            tts,  # sentence-streams LLM tokens into audio
-            SpookyVoiceFilter(),
-            transport.output(),
-            aggregators.assistant(),
-        ]
-    )
-
-    # Forget the previous visitor after sustained silence.
-    reset_task: asyncio.Task | None = None
-    attract_task: asyncio.Task | None = None
-
-    async def reset_after_silence():
-        await asyncio.sleep(CONTEXT_RESET_SECS)
-        context.set_messages([])
-        logger.info("Silence: conversation context cleared.")
-
-    async def attract_after_silence():
-        if IDLE_ATTRACT_SECS is None:
-            return
-        while True:
-            await asyncio.sleep(IDLE_ATTRACT_SECS)
-            try:
-                response = await attract_client.chat.completions.create(
-                    model=OLLAMA_MODEL,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a playful, spooky Halloween tree welcoming trick-or-treaters. "
-                                "Be family-friendly and inviting, with no threats. Output only spoken words."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                "Invent a fresh, one-sentence callout that invites nearby trick-or-treaters "
-                                "to come closer to talk or get Halloween treats. Keep it under 16 words."
-                            ),
-                        },
-                    ],
-                    max_tokens=40,
-                    temperature=0.9,
-                    extra_body={"keep_alive": OLLAMA_KEEP_ALIVE},
-                )
-                line = response.choices[0].message.content
-                if not line or not line.strip():
-                    logger.warning("Ollama generated an empty idle callout.")
-                    continue
-                await tts.queue_frame(TTSSpeakFrame(line.strip(), append_to_context=False))
-                logger.info("Silence: AI-generated idle callout queued.")
-            except Exception:
-                logger.exception("Could not generate idle callout.")
-
-    def schedule_attraction():
-        nonlocal attract_task
-        if IDLE_ATTRACT_SECS is not None:
-            if attract_task:
-                attract_task.cancel()
-            attract_task = asyncio.create_task(attract_after_silence())
-
-    @user_agg.event_handler("on_user_turn_started")
-    async def _on_started(*_):
-        nonlocal reset_task
-        if reset_task:
-            reset_task.cancel()
-        if attract_task:
-            attract_task.cancel()
-
-    discord = DiscordLogger(DISCORD_WEBHOOK_URL)
-    discord.start()
-    logger.info(f"Discord logging {'enabled' if discord.enabled else 'disabled (DISCORD_WEBHOOK_URL not set)'}")
-
-    @aggregators.assistant().event_handler("on_assistant_turn_stopped")
-    async def _on_bot_stopped(_agg, message):
-        logger.debug(f"Discord log bot: {message.content!r}")
-        discord.log_bot(message.content)
-
-    @user_agg.event_handler("on_user_turn_stopped")
-    async def _on_stopped(_agg, _strategy, message):
-        logger.debug(f"Discord log user: {message.content!r}")
-        discord.log_user(message.content)
-        nonlocal reset_task
-        if reset_task:
-            reset_task.cancel()
-        reset_task = asyncio.create_task(reset_after_silence())
-        schedule_attraction()
-
-    worker = PipelineWorker(pipeline, idle_timeout_secs=None)
-    runner = WorkerRunner()
-    await runner.add_workers(worker)
-    schedule_attraction()
-    logger.info("The demon awakens... speak, mortal.")
+    audio = pyaudio.PyAudio()
+    mic = None
+    speaker = None
     try:
-        await runner.run()
+        async with client.aio.live.connect(model=GEMINI_MODEL, config=config) as session:
+            loop = asyncio.get_running_loop()
+            mic_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=16)
+            output_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=32)
+            effects = VoiceEffects()
+            speaking = threading.Event()
+
+            def enqueue_mic(pcm: bytes):
+                if mic_queue.full():
+                    try:
+                        mic_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                mic_queue.put_nowait(pcm)
+
+            def mic_callback(in_data, _frame_count, _time_info, _status):
+                if in_data:
+                    if MUTE_MIC_WHILE_SPEAKING and speaking.is_set():
+                        in_data = bytes(len(in_data))
+                    loop.call_soon_threadsafe(enqueue_mic, in_data)
+                return None, pyaudio.paContinue
+
+            mic = audio.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=MIC_RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SAMPLES,
+                stream_callback=mic_callback,
+                start=False,
+            )
+            speaker = audio.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SPEAKER_RATE,
+                output=True,
+                frames_per_buffer=CHUNK_SAMPLES,
+                start=False,
+            )
+            mic.start_stream()
+            speaker.start_stream()
+            logger.info("The demon awakens... speak, mortal. Press Ctrl+C to stop.")
+            sender = asyncio.create_task(send_microphone(session, mic_queue, speaking))
+            player = asyncio.create_task(play_audio(output_queue, speaker, speaking))
+            try:
+                await receive_responses(session, output_queue, effects, speaking)
+            finally:
+                sender.cancel()
+                player.cancel()
+                await asyncio.gather(sender, player, return_exceptions=True)
     finally:
-        await attract_client.close()
+        if mic is not None:
+            if mic.is_active():
+                mic.stop_stream()
+            mic.close()
+        if speaker is not None:
+            if speaker.is_active():
+                speaker.stop_stream()
+            speaker.close()
+        audio.terminate()
+
+
+def main():
+    api_key = load_api_key()
+    if not api_key:
+        raise SystemExit("GOOGLE_API_KEY is not set (environment or .env).")
+    try:
+        asyncio.run(run_live(api_key))
+    except KeyboardInterrupt:
+        logger.info("The demon returns to its tree.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
