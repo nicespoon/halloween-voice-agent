@@ -40,7 +40,7 @@ SYSTEM_PROMPT = (
     "Be playful, welcoming, and spooky-funny, like a dramatic host at a haunted house. "
     "React to what visitors say and give out pretend supernatural praise for brave answers. "
     "Keep it family-friendly: no genuinely scary threats, insults, or adult jokes. "
-    "Use natural spoken language and usually give two to four short sentences per reply. "
+    "Use natural spoken language and usually give one to three short sentences per reply. "
     "Respond directly, sometimes adding a playful detail or a friendly question to keep the conversation going. "
     "Output only the words you want spoken aloud. NEVER include stage directions, action nor emotion cues, "
     "sound-effect text, nor asides in parentheses, brackets, or asterisks. "
@@ -60,9 +60,9 @@ MUTE_USER_WHILE_SPEAKING = True
 # Seconds of silence before the visitor's turn is considered finished.
 VAD_STOP_SECS = 0.2
 # Minimum measured audio volume required for speech detection.
-VAD_MIN_VOLUME = 0.10
+VAD_MIN_VOLUME = 0.1
 # Hard upper bound; the system prompt controls the usual reply length.
-MAX_REPLY_TOKENS = 60
+MAX_REPLY_TOKENS = None
 # Seconds after the last visitor turn before conversation history is cleared.
 CONTEXT_RESET_SECS = 60
 # Set to a number of silent seconds to enable an idle callout; None disables it.
